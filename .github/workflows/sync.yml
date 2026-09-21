@@ -1,8 +1,10 @@
 name: Upstream Sync
 
+# GITHUB_TOKEN cannot update workflow files (no workflows permission key).
+# Sync code from upstream but keep this fork's .github/workflows/* unchanged
+# so scheduled syncs no longer fail when upstream edits CI YAML.
 permissions:
   contents: write
-  workflows: write  # required to push upstream changes to .github/workflows/*
 
 on:
   schedule:
@@ -17,29 +19,46 @@ jobs:
 
     steps:
       - name: Checkout target repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Sync upstream changes
+      - name: Sync upstream changes (exclude workflows)
         run: |
+          set -euo pipefail
           git config user.name "GH Action - Upstream Sync"
           git config user.email "action@github.com"
 
-          git remote add upstream https://github.com/cmliu/edgetunnel.git
+          git remote add upstream https://github.com/cmliu/edgetunnel.git || true
           git fetch upstream main
 
-          if git diff --quiet HEAD upstream/main; then
-            # 内容和上游一致，直接对齐，顺带清理历史分叉留下的多余 merge commit
-            git reset --hard upstream/main
-            git push --force-with-lease origin main
-          else
-            # 有本地修改，保持原来的合并方式，不覆盖任何人的改动
-            if ! git pull --no-rebase upstream main; then
-              echo "[Error] 合并上游变更产生冲突，自动同步已暂停，请手动 Sync Fork 并解决冲突。"
-              echo "[Error] Merge conflict detected while syncing upstream. Please sync your fork manually and resolve the conflicts."
-              exit 1
-            fi
-            git push origin main
+          # Preserve this fork's workflow definitions across the sync.
+          mkdir -p /tmp/bridge-workflows-backup
+          cp -a .github/workflows/. /tmp/bridge-workflows-backup/
+
+          if git merge-base --is-ancestor HEAD upstream/main && \
+             [ "$(git rev-parse HEAD)" = "$(git rev-parse upstream/main)" ]; then
+            echo "Already up to date with upstream/main"
+            exit 0
           fi
+
+          # Prefer a merge so local-only commits (if any) are kept.
+          if ! git merge --no-edit upstream/main; then
+            echo "[Error] Merge conflict while syncing upstream. Resolve via Sync fork UI."
+            git merge --abort || true
+            exit 1
+          fi
+
+          # Restore workflows so we never push upstream CI changes with GITHUB_TOKEN.
+          mkdir -p .github/workflows
+          rm -rf .github/workflows/*
+          cp -a /tmp/bridge-workflows-backup/. .github/workflows/
+          git add -A .github/workflows
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(ci): keep fork workflows after upstream sync"
+          fi
+
+          git push origin main
+          echo "Sync complete"
